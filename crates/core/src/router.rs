@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use crate::board::{Board, NetClass};
+use crate::board::{pair_clearance, Board, NetClass};
 use crate::geometry::P;
 use crate::grid::{effective_classes, Grid, PadCells};
 use rayon::prelude::*;
@@ -280,7 +280,8 @@ impl<'a> Router<'a> {
         let quant = 0.5 * std::f64::consts::SQRT_2 * pitch;
         let discs: Vec<ClassDiscs> = classes
             .iter()
-            .map(|k| {
+            .enumerate()
+            .map(|(ki, k)| {
                 let wk = k.width / 2.0;
                 let vrk = k.via_diameter / 2.0;
                 let mut cd = ClassDiscs {
@@ -293,8 +294,13 @@ impl<'a> Router<'a> {
                     via_aura: Vec::new(),
                     via_tight: Vec::new(),
                 };
-                for bp in &grid.buckets {
-                    let cc = k.clearance.max(bp.clearance);
+                for (b, bp) in grid.buckets.iter().enumerate() {
+                    let cc = pair_clearance(
+                        &classes,
+                        &board.pair_clearances,
+                        ki,
+                        grid.bucket_class[b],
+                    );
                     let wb = bp.width / 2.0;
                     let vrb = bp.via_diameter / 2.0;
                     cd.wire_usage.push(disc_spans((wk + cc + wb) / pitch));
@@ -314,6 +320,11 @@ impl<'a> Router<'a> {
         let nnets = board.nets.len();
         let mut net_terms: Vec<Vec<u32>> = vec![Vec::new(); nnets];
         for (pi, pad) in board.pads.iter().enumerate() {
+            // Pour interiors are NOT exempt from stamping: stubs inside a
+            // pour are real fixed copper that other nets must clear.
+            if pad.is_pour {
+                continue;
+            }
             if let Some(net) = pad.net {
                 net_terms[net].extend_from_slice(&pad_cells[pi]);
             }
@@ -996,14 +1007,21 @@ impl<'a> Router<'a> {
             centers.iter().map(|c| c[1]).sum::<f64>() / centers.len() as f64,
         ];
         let mut remaining: Vec<usize> = (0..pads.len()).collect();
-        let start = remaining
+        // A pour is one big connected region: start the tree there when the
+        // net has one, else at the pad nearest the centroid.
+        let start = pads
             .iter()
-            .copied()
-            .min_by(|&a, &b| {
-                crate::geometry::dist(centers[a], centroid)
-                    .total_cmp(&crate::geometry::dist(centers[b], centroid))
-            })
-            .unwrap();
+            .position(|&pi| self.board.pads[pi].is_pour && !self.pad_cells[pi].is_empty())
+            .unwrap_or_else(|| {
+                remaining
+                    .iter()
+                    .copied()
+                    .min_by(|&a, &b| {
+                        crate::geometry::dist(centers[a], centroid)
+                            .total_cmp(&crate::geometry::dist(centers[b], centroid))
+                    })
+                    .unwrap()
+            });
         remaining.retain(|&i| i != start);
 
         let mut tree: Vec<u32> = self.pad_cells[pads[start]].clone();
@@ -1047,6 +1065,10 @@ impl<'a> Router<'a> {
                     // to run close to itself, so its own earlier legs must not
                     // show up as congestion while routing the later ones.
                     tree.extend_from_slice(&path);
+                    // Reaching a pour connects the whole region.
+                    if self.board.pads[pads[pad_local]].is_pour {
+                        tree.extend_from_slice(&self.pad_cells[pads[pad_local]]);
+                    }
                     tree_centers.push(centers[pad_local]);
                     legs.push(Leg {
                         cells: path,
@@ -1485,18 +1507,22 @@ impl<'a> Router<'a> {
                 let (mut snap_front, mut snap_back) = (None, None);
                 if i == 0 {
                     if let Some(sp) = leg.start_pad {
-                        while a < b && inside(sp, cells[a]) {
-                            a += 1;
+                        if !self.board.pads[sp].is_pour {
+                            while a < b && inside(sp, cells[a]) {
+                                a += 1;
+                            }
+                            snap_front = Some(self.board.pads[sp].shape.center());
                         }
-                        snap_front = Some(self.board.pads[sp].shape.center());
                     }
                 }
                 if j + 1 == cells.len() {
                     if let Some(ep) = leg.end_pad {
-                        while b > a && inside(ep, cells[b]) {
-                            b -= 1;
+                        if !self.board.pads[ep].is_pour {
+                            while b > a && inside(ep, cells[b]) {
+                                b -= 1;
+                            }
+                            snap_back = Some(self.board.pads[ep].shape.center());
                         }
-                        snap_back = Some(self.board.pads[ep].shape.center());
                     }
                 }
                 let mut pts = simplify(&self.grid, &cells[a..=b]);
@@ -1581,7 +1607,7 @@ fn emit_necked(
     let mut end_back = 0usize; // vertices consumed by the back neck
     if let Some(pi) = front_pad {
         let nw = neck_width(pi);
-        if width > nw + 1.0 {
+        if !board.pads[pi].is_pour && width > nw + 1.0 {
             let cut = split_at_distance(&mut pts, true, neck_reach(pi));
             if cut >= 1 {
                 segs.push(RouteSeg {
@@ -1595,7 +1621,7 @@ fn emit_necked(
     }
     if let Some(pi) = back_pad {
         let nw = neck_width(pi);
-        if width > nw + 1.0 {
+        if !board.pads[pi].is_pour && width > nw + 1.0 {
             let cut = split_at_distance(&mut pts, false, neck_reach(pi));
             if cut > start {
                 segs.push(RouteSeg {
@@ -1818,6 +1844,7 @@ mod tests {
             shape: PadShape::Circle { center: [x, y], diameter: 1000.0 },
             layers: vec![0, 1],
             net: Some(net),
+            is_pour: false,
         }
     }
 
@@ -1839,6 +1866,7 @@ mod tests {
             ],
             rules: Rules::default(),
             classes: Vec::new(),
+            pair_clearances: Vec::new(),
         }
     }
 

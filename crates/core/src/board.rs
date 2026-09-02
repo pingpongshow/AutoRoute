@@ -122,6 +122,10 @@ pub struct Pad {
     pub layers: Vec<usize>,
     /// Net index into `Board::nets`, or None if unconnected (pure obstacle).
     pub net: Option<usize>,
+    /// A copper pour region: a routable terminal for its net (stubs and
+    /// stitching vias may end anywhere inside), but NOT an obstacle for other
+    /// nets — the pour refills around foreign copper.
+    pub is_pour: bool,
 }
 
 /// A net class: per-class routing rules. Class 0 is always the default class.
@@ -164,6 +168,27 @@ pub struct Board {
     pub rules: Rules,
     /// Net classes; index 0 is the default class.
     pub classes: Vec<NetClass>,
+    /// Pair clearance overrides (class_a, class_b, um) from conditional
+    /// design rules; effective pair clearance = max(a, b, override).
+    pub pair_clearances: Vec<(usize, usize, f64)>,
+}
+
+/// Effective clearance between two classes.
+pub fn pair_clearance(
+    classes: &[NetClass],
+    overrides: &[(usize, usize, f64)],
+    a: usize,
+    b: usize,
+) -> f64 {
+    let mut c = classes[a.min(classes.len() - 1)]
+        .clearance
+        .max(classes[b.min(classes.len() - 1)].clearance);
+    for &(x, y, v) in overrides {
+        if (x == a && y == b) || (x == b && y == a) {
+            c = c.max(v);
+        }
+    }
+    c
 }
 
 impl Board {

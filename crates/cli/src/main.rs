@@ -147,6 +147,47 @@ fn main() {
                 for name in &mins.unsupported {
                     eprintln!("dru: rule \"{name}\" not supported, ignored");
                 }
+                // Conditional netclass-pair clearances.
+                let match_class = |board: &autoroute_core::Board, want: &str| -> Vec<usize> {
+                    board
+                        .classes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            c.name == want || c.name.starts_with(&format!("{want},"))
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                };
+                let mut overrides: Vec<(usize, usize, f64)> = Vec::new();
+                for (a, b, v) in &mins.pair_rules {
+                    let ai = match_class(&parsed.board, a);
+                    if ai.is_empty() {
+                        eprintln!("dru: pair rule class {a} not found, ignored");
+                        continue;
+                    }
+                    let bi: Vec<usize> = match b {
+                        Some(bn) => {
+                            let m = match_class(&parsed.board, bn);
+                            if m.is_empty() {
+                                eprintln!("dru: pair rule class {bn} not found, ignored");
+                                continue;
+                            }
+                            m
+                        }
+                        None => (0..parsed.board.classes.len()).collect(),
+                    };
+                    for &x in &ai {
+                        for &y in &bi {
+                            eprintln!(
+                                "dru: pair clearance {} <-> {}: {v} um",
+                                parsed.board.classes[x].name, parsed.board.classes[y].name
+                            );
+                            overrides.push((x, y, *v));
+                        }
+                    }
+                }
+                parsed.board.pair_clearances = overrides;
                 for cl in &mut parsed.board.classes {
                     if let Some(c) = mins.clearance {
                         if cl.clearance < c {

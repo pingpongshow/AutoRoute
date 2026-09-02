@@ -295,7 +295,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                 let abs = shifted.transform(back, if back { -rot } else { rot }, [px, py]);
                 let id = format!("{reference}-{}", pin.id);
                 pad_by_id.insert(id.clone(), pads.len());
-                pads.push(Pad { id, shape: abs, layers: pad_layers, net: None });
+                pads.push(Pad { id, shape: abs, layers: pad_layers, net: None , is_pour: false});
             }
             // Footprint keepouts become unconnected hard obstacles.
             for (lname, shape) in &image.keepouts {
@@ -306,7 +306,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                     (0..layer_names.len()).collect()
                 };
                 let abs = shape.transform(back, if back { -rot } else { rot }, [px, py]);
-                pads.push(Pad { id: String::new(), shape: abs, layers, net: None });
+                pads.push(Pad { id: String::new(), shape: abs, layers, net: None , is_pour: false});
             }
         }
     }
@@ -421,25 +421,62 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                         .get(&lname)
                         .map(|&l| vec![l])
                         .unwrap_or_else(|| (0..layer_names.len()).collect());
-                    pads.push(Pad { id: String::new(), shape: s, layers, net: None });
+                    pads.push(Pad { id: String::new(), shape: s, layers, net: None , is_pour: false});
                 }
             }
         }
     }
 
-    // --- Copper pours: a net with a plane is connected by the pour, not by
-    // tracks — leave it to the pour (fixed) rather than emitting redundant
-    // (and pour-ignorant) routing.
+    // --- Copper pours: each plane becomes a routable pour region for its
+    // net — pads not already inside it get stitched to it with stubs and
+    // vias — while never blocking other nets (the pour refills around them).
     let mut poured_nets = 0usize;
     if keep_wiring {
+        let mut seen_pour: Vec<bool> = vec![false; nets.len()];
         for plane in structure.children("plane") {
-            if let Some(net_name) = plane.str_arg(0) {
-                if let Some(&ni) = net_index.get(net_name) {
-                    if !nets[ni].fixed {
-                        nets[ni].fixed = true;
-                        poured_nets += 1;
-                    }
-                }
+            let net_name = match plane.str_arg(0) {
+                Some(n) => n,
+                None => continue,
+            };
+            let ni = match net_index.get(net_name) {
+                Some(&ni) => ni,
+                None => continue,
+            };
+            let poly = match plane.child("polygon") {
+                Some(p) => p,
+                None => continue,
+            };
+            let lname = poly.str_arg(0).unwrap_or("");
+            let layer = match layer_index.get(lname) {
+                Some(&l) => l,
+                None => continue,
+            };
+            let coords: Vec<f64> = poly
+                .args()
+                .iter()
+                .skip(2)
+                .filter_map(|a| a.as_atom().and_then(|s| s.parse::<f64>().ok()))
+                .collect();
+            let mut pts: Vec<P> = coords
+                .chunks_exact(2)
+                .map(|xy| [xy[0] * scale, xy[1] * scale])
+                .collect();
+            pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9);
+            if pts.len() < 3 {
+                continue;
+            }
+            let pad_idx = pads.len();
+            pads.push(Pad {
+                id: format!("pour-{net_name}"),
+                shape: PadShape::Polygon { pts },
+                layers: vec![layer],
+                net: Some(ni),
+                is_pour: true,
+            });
+            nets[ni].pads.push(pad_idx);
+            if !seen_pour[ni] {
+                seen_pour[ni] = true;
+                poured_nets += 1;
             }
         }
     }
@@ -489,6 +526,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                                 shape: PadShape::Path { width: w, pts: sw.to_vec() },
                                 layers: vec![layer],
                                 net,
+                                is_pour: false,
                             });
                         }
                         if pts.len() == 1 {
@@ -497,6 +535,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                                 shape: PadShape::Path { width: w, pts },
                                 layers: vec![layer],
                                 net,
+                                is_pour: false,
                             });
                         }
                     }
@@ -525,6 +564,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
                             shape: PadShape::Circle { center: [x, y], diameter: dia },
                             layers: (0..layer_names.len()).collect(),
                             net,
+                            is_pour: false,
                         });
                     }
                     _ => {}
@@ -548,6 +588,7 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
             nets,
             rules,
             classes,
+            pair_clearances: Vec::new(),
         },
         warnings,
         fixed_nets,

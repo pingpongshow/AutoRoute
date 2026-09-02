@@ -14,8 +14,41 @@ pub struct DruMins {
     pub clearance: Option<f64>,
     /// Minimum track width, um.
     pub track_width: Option<f64>,
+    /// Conditional pair rules: (class A, class B or None = any, clearance um)
+    /// from conditions like "A.NetClass == 'X' && B.NetClass == 'Y'".
+    pub pair_rules: Vec<(String, Option<String>, f64)>,
     /// Names of rules that were ignored.
     pub unsupported: Vec<String>,
+}
+
+/// Extract netclass names from a condition of the supported shape.
+fn parse_condition(cond: &str) -> Option<(String, Option<String>)> {
+    let mut a: Option<String> = None;
+    let mut b: Option<String> = None;
+    for part in cond.split("&&") {
+        let part = part.trim();
+        let (side, rest) = if let Some(r) = part.strip_prefix("A.NetClass") {
+            (0, r)
+        } else if let Some(r) = part.strip_prefix("B.NetClass") {
+            (1, r)
+        } else {
+            return None; // unsupported clause
+        };
+        let rest = rest.trim().strip_prefix("==")?.trim();
+        let name = rest
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        if side == 0 {
+            a = Some(name);
+        } else {
+            b = Some(name);
+        }
+    }
+    match (a, b) {
+        (Some(a), b) => Some((a, b)),
+        (None, Some(b)) => Some((b, None)),
+        (None, None) => None,
+    }
 }
 
 fn parse_len(s: &str) -> Option<f64> {
@@ -38,8 +71,17 @@ pub fn parse_dru(text: &str) -> Result<DruMins, String> {
     let mut out = DruMins::default();
     for rule in root.children("rule") {
         let name = rule.str_arg(0).unwrap_or("").to_string();
-        if rule.child("condition").is_some() {
-            out.unsupported.push(name);
+        if let Some(cond) = rule.child("condition").and_then(|c| c.str_arg(0)) {
+            let min = rule
+                .children("constraint")
+                .find(|c| c.str_arg(0) == Some("clearance"))
+                .and_then(|c| c.child("min"))
+                .and_then(|m| m.str_arg(0))
+                .and_then(parse_len);
+            match (parse_condition(cond), min) {
+                (Some((a, b)), Some(v)) => out.pair_rules.push((a, b, v)),
+                _ => out.unsupported.push(name),
+            }
             continue;
         }
         let mut used = false;
@@ -94,6 +136,7 @@ mod tests {
 "#;
         let d = parse_dru(text).unwrap();
         assert_eq!(d.clearance, Some(127.0));
-        assert_eq!(d.unsupported, vec!["fancy".to_string()]);
+        assert!(d.unsupported.is_empty());
+        assert_eq!(d.pair_rules, vec![("HV".to_string(), None, 1000.0)]);
     }
 }

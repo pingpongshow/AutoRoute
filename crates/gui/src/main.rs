@@ -316,6 +316,14 @@ impl App {
             if !visible {
                 continue;
             }
+            if pad.is_pour {
+                if let PadShape::Polygon { pts } = &pad.shape {
+                    let spts: Vec<Pos2> = pts.iter().map(|p| self.to_screen(*p)).collect();
+                    let c = layer_color(pad.layers[0]).gamma_multiply(0.15);
+                    painter.add(egui::Shape::convex_polygon(spts, c, Stroke::NONE));
+                }
+                continue;
+            }
             let color = if pad.layers.len() > 1 {
                 Color32::from_rgb(200, 170, 60) // through-hole gold
             } else {

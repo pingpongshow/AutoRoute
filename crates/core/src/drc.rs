@@ -1,7 +1,7 @@
 //! Post-route geometric DRC: exact clearance checks on the emitted geometry,
 //! independent of the router's grid bookkeeping.
 
-use crate::board::{Board, NetClass, Pad};
+use crate::board::{pair_clearance, Board, NetClass, Pad};
 use crate::geometry::{dist, P};
 use crate::grid::effective_classes;
 use crate::router::RouteResult;
@@ -84,11 +84,11 @@ fn segs_intersect(a1: P, a2: P, b1: P, b2: P) -> bool {
 
 struct Item {
     net: usize,
+    class: usize,
     layer: Option<usize>, // None = spans all layers (via)
     a: P,
     b: P,
     half_width: f64,
-    clearance: f64,
     kind: &'static str,
 }
 
@@ -99,16 +99,17 @@ pub fn check(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Violati
     let classes = effective_classes(board);
     let mut items: Vec<Item> = Vec::new();
     for rn in &result.nets {
-        let class = class_of(&classes, board, rn.net);
+        let ci = board.nets[rn.net].class.min(classes.len() - 1);
+        let class = &classes[ci];
         for seg in &rn.segs {
             for w in seg.pts.windows(2) {
                 items.push(Item {
                     net: rn.net,
+                    class: ci,
                     layer: Some(seg.layer),
                     a: w[0],
                     b: w[1],
                     half_width: seg.width / 2.0,
-                    clearance: class.clearance,
                     kind: "track",
                 });
             }
@@ -116,11 +117,11 @@ pub fn check(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Violati
         for v in &rn.vias {
             items.push(Item {
                 net: rn.net,
+                class: ci,
                 layer: None,
                 a: *v,
                 b: *v,
                 half_width: class.via_diameter / 2.0,
-                clearance: class.clearance,
                 kind: "via",
             });
         }
@@ -131,6 +132,7 @@ pub fn check(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Violati
         .flat_map_iter(|i| {
             let items = &items;
             let board = &*board;
+            let classes = &classes;
             ((i + 1)..items.len()).filter_map(move |j| {
                 let (x, y) = (&items[i], &items[j]);
                 if x.net == y.net {
@@ -143,7 +145,8 @@ pub fn check(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Violati
                 }
                 let (d, px, py) = seg_seg_closest(x.a, x.b, y.a, y.b);
                 let gap = d - x.half_width - y.half_width;
-                let clearance = x.clearance.max(y.clearance);
+                let clearance =
+                    pair_clearance(&classes, &board.pair_clearances, x.class, y.class);
                 if gap >= clearance - tolerance {
                     return None;
                 }
@@ -151,10 +154,9 @@ pub fn check(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Violati
                 // the pad itself: spacing there is pad placement, not routing
                 // (pad-entry stubs are snapped to pad centers).
                 let subsumed = |net: usize, p: P, hw: f64| {
-                    board
-                        .pads
-                        .iter()
-                        .any(|op| op.net == Some(net) && op.shape.signed_dist(p) <= -hw)
+                    board.pads.iter().any(|op| {
+                        !op.is_pour && op.net == Some(net) && op.shape.signed_dist(p) <= -hw
+                    })
                 };
                 if subsumed(x.net, px, x.half_width) || subsumed(y.net, py, y.half_width) {
                     return None;
@@ -193,7 +195,7 @@ pub fn check_via_pads(board: &Board, result: &RouteResult, tolerance: f64) -> Ve
         let via_r = class.via_diameter / 2.0;
         for v in &rn.vias {
             for pad in &board.pads {
-                if pad.net == Some(rn.net) {
+                if pad.net == Some(rn.net) || pad.is_pour {
                     continue;
                 }
                 let clearance = class.clearance.max(pad_clearance(&classes, board, pad));
@@ -223,7 +225,7 @@ pub fn check_pads(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Vi
         let net_clearance = class_of(&classes, board, rn.net).clearance;
         for seg in &rn.segs {
             for pad in &board.pads {
-                if pad.net == Some(rn.net) {
+                if pad.net == Some(rn.net) || pad.is_pour {
                     continue;
                 }
                 let clearance = net_clearance.max(pad_clearance(&classes, board, pad));

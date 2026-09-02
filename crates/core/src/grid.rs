@@ -6,7 +6,7 @@
 //! distinct (width, clearance, via diameter) combination among the classes.
 //! Each net reads only its own bucket's fields.
 
-use crate::board::{Board, NetClass, Pad};
+use crate::board::{pair_clearance, Board, NetClass, Pad};
 use crate::geometry::{poly_signed_dist, P};
 use rayon::prelude::*;
 
@@ -37,6 +37,8 @@ pub struct Grid {
     pub buckets: Vec<BucketParams>,
     /// Class index -> bucket index.
     pub class_bucket: Vec<usize>,
+    /// Bucket index -> representative class index.
+    pub bucket_class: Vec<usize>,
     /// Wire ownership per (bucket, layer, y, x): FREE, HARD, or a net index
     /// (passable only for that net). Margins are bucket-specific.
     block: Vec<i32>,
@@ -64,26 +66,33 @@ fn merge_owner(cur: i32, owner: i32) -> i32 {
     }
 }
 
-/// Deduplicate class rule combinations into buckets.
-pub fn make_buckets(classes: &[NetClass]) -> (Vec<BucketParams>, Vec<usize>) {
+/// Deduplicate class rule combinations into buckets. With pair-clearance
+/// overrides in play, classes with identical parameters may still differ in
+/// pair rules, so dedup is disabled and buckets map 1:1 to classes.
+pub fn make_buckets(
+    classes: &[NetClass],
+    dedup: bool,
+) -> (Vec<BucketParams>, Vec<usize>, Vec<usize>) {
     let mut buckets: Vec<BucketParams> = Vec::new();
     let mut class_bucket = Vec::with_capacity(classes.len());
-    for cl in classes {
+    let mut bucket_class: Vec<usize> = Vec::new();
+    for (ci, cl) in classes.iter().enumerate() {
         let p = BucketParams {
             width: cl.width,
             clearance: cl.clearance,
             via_diameter: cl.via_diameter,
         };
-        let b = match buckets.iter().position(|q| *q == p) {
+        let b = match buckets.iter().position(|q| dedup && *q == p) {
             Some(b) => b,
             None => {
                 buckets.push(p);
+                bucket_class.push(ci);
                 buckets.len() - 1
             }
         };
         class_bucket.push(b);
     }
-    (buckets, class_bucket)
+    (buckets, class_bucket, bucket_class)
 }
 
 impl Grid {
@@ -139,7 +148,8 @@ impl Grid {
     /// Rasterize a board. `pitch` in um.
     pub fn build(board: &Board, pitch: f64) -> (Grid, PadCells) {
         let classes = effective_classes(board);
-        let (buckets, class_bucket) = make_buckets(&classes);
+        let (buckets, class_bucket, bucket_class) =
+            make_buckets(&classes, board.pair_clearances.is_empty());
         let nb = buckets.len();
 
         let (lo, hi) = board.bbox();
@@ -161,6 +171,7 @@ impl Grid {
             ncells,
             buckets,
             class_bucket,
+            bucket_class,
             block: vec![HARD; nb * ncells],
             tight: vec![false; nb * ncells],
             // HARD by default so vias cannot land outside the boundary; the
@@ -218,15 +229,22 @@ impl Grid {
             .pads
             .iter()
             .map(|pad| {
-                let pad_clearance = match pad.net {
-                    Some(n) => classes[board.nets[n].class.min(classes.len() - 1)].clearance,
-                    None => classes[0].clearance,
+                let pad_class = match pad.net {
+                    Some(n) => board.nets[n].class.min(classes.len() - 1),
+                    None => 0,
                 };
+                let pad_clearance = classes[pad_class].clearance;
                 let margins: Vec<(f64, f64)> = grid
                     .buckets
                     .iter()
-                    .map(|bp| {
-                        let c = bp.clearance.max(pad_clearance);
+                    .enumerate()
+                    .map(|(b, bp)| {
+                        let c = pair_clearance(
+                            &classes,
+                            &board.pair_clearances,
+                            pad_class,
+                            grid.bucket_class[b],
+                        );
                         (c + bp.width / 2.0, c + bp.via_diameter / 2.0)
                     })
                     .collect();
@@ -247,6 +265,9 @@ impl Grid {
         for ((pad, (_, margins, _)), cells) in
             board.pads.iter().zip(pad_meta.iter()).zip(samples.iter())
         {
+            if pad.is_pour {
+                continue;
+            }
             let owner = match pad.net {
                 Some(n) => n as i32,
                 None => HARD,
@@ -293,6 +314,14 @@ impl Grid {
                             continue;
                         }
                         let c = grid.idx(l, x, y);
+                        if pad.is_pour {
+                            // Pour interiors are terminals wherever they are
+                            // already passable — never forced, never owned.
+                            if grid.passable(nb_own, c, net) {
+                                cells.push(c);
+                            }
+                            continue;
+                        }
                         let i = grid.bi(nb_own, c);
                         // A terminal forced out of contested/blocked space sits
                         // inside some foreign pad's clearance margin: exits
@@ -307,7 +336,7 @@ impl Grid {
                 }
             }
             // Grid too coarse to land a cell inside the pad: force the nearest cell.
-            if cells.is_empty() {
+            if cells.is_empty() && !pad.is_pour {
                 let cp = pad.shape.center();
                 let (x, y) = grid.cell_of(cp);
                 for &l in &pad.layers {
@@ -388,17 +417,20 @@ mod tests {
                     shape: PadShape::Circle { center: [2000.0, 5000.0], diameter: 1000.0 },
                     layers: vec![0, 1],
                     net: Some(0),
+                    is_pour: false,
                 },
                 Pad {
                     id: "R1-2".into(),
                     shape: PadShape::Circle { center: [8000.0, 5000.0], diameter: 1000.0 },
                     layers: vec![0, 1],
                     net: Some(0),
+                    is_pour: false,
                 },
             ],
             nets: vec![Net { name: "N1".into(), pads: vec![0, 1], class: 0, fixed: false }],
             rules: Rules::default(),
             classes: Vec::new(),
+            pair_clearances: Vec::new(),
         }
     }
 

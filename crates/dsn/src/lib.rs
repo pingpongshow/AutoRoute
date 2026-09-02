@@ -148,7 +148,8 @@ mod tests {
 
     #[test]
     fn test_pour_connected_net() {
-        // GND has a copper pour: it is left to the pour, not routed.
+        // GND has a full-board copper pour on F.Cu: its pads connect by
+        // stitching into the pour region rather than pad-to-pad tracks.
         let demo_poured = DEMO.replace(
             "    (via \"Via[0-1]_800:400_um\")",
             "    (plane GND (polygon F.Cu 0 0 0 30000 0 30000 -20000 0 -20000))\n    (via \"Via[0-1]_800:400_um\")",
@@ -156,11 +157,20 @@ mod tests {
         let parsed = parse_dsn(&demo_poured).unwrap();
         assert_eq!(parsed.poured_nets, 1);
         let gnd = parsed.board.nets.iter().position(|n| n.name == "GND").unwrap();
-        assert!(parsed.board.nets[gnd].fixed);
+        // Pour nets are routable (stitched), not fixed.
+        assert!(!parsed.board.nets[gnd].fixed);
+        let pour_pad = parsed.board.nets[gnd]
+            .pads
+            .iter()
+            .find(|&&pi| parsed.board.pads[pi].is_pour);
+        assert!(pour_pad.is_some(), "pour pseudo-pad attached to net");
         let cancel = AtomicBool::new(false);
         let result = route_board(&parsed.board, RouterConfig::default(), &cancel, &mut |_| {});
-        assert!(result.complete);
-        assert!(result.nets[gnd].segs.is_empty());
+        assert!(result.complete, "pour-stitched board should route: {result:?}");
+        // GND pads sit inside the pour on F.Cu: connections are trivial,
+        // no long pad-to-pad track needed (a stub is allowed, so just check
+        // the total is far below the 12mm pad separation).
+        assert!(result.nets[gnd].length < 6000.0, "len {}", result.nets[gnd].length);
     }
 
     #[test]

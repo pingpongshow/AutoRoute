@@ -126,6 +126,20 @@ pub fn render_svg(board: &Board, nets: &[SesNet]) -> String {
 
     // Pads.
     for p in &board.pads {
+        if p.is_pour {
+            if let PadShape::Polygon { pts } = &p.shape {
+                let pp: Vec<String> =
+                    pts.iter().map(|q| format!("{:.0},{:.0}", q[0], -q[1])).collect();
+                writeln!(
+                    s,
+                    r#"<polygon points="{}" fill="{}" fill-opacity="0.10"/>"#,
+                    pp.join(" "),
+                    LAYER_COLORS[p.layers.first().copied().unwrap_or(0) % LAYER_COLORS.len()]
+                )
+                .unwrap();
+            }
+            continue;
+        }
         let color = if p.layers.len() > 1 {
             "#c8aa3c"
         } else {

@@ -4,7 +4,7 @@
 //! centers, via positions, layer-change junctions) are never moved, so
 //! connectivity is untouched; the DRC can verify the result independently.
 
-use crate::board::{Board, NetClass, Pad};
+use crate::board::{pair_clearance, Board, NetClass, Pad};
 use crate::geometry::{poly_signed_dist, P};
 use crate::grid::effective_classes;
 use crate::router::RouteResult;
@@ -13,12 +13,13 @@ const SAFETY: f64 = 2.0; // um beyond the exact clearance
 const HASH_CELL: f64 = 2000.0; // um
 
 struct Item {
+    #[allow(dead_code)]
     net: Option<usize>,
+    class: usize,
     layer: Option<usize>, // None = all layers (via)
     a: P,
     b: P,
     half_width: f64,
-    clearance: f64,
 }
 
 struct SpatialHash {
@@ -90,6 +91,7 @@ pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
         let mut pass_removed = 0usize;
         for ni in 0..net_count {
             let net = result.nets[ni].net;
+            let my_ci = board.nets[net].class.min(classes.len() - 1);
             let my_class = class_of(&classes, board, net);
             let my_hw = |seg_w: f64| seg_w / 2.0;
 
@@ -99,27 +101,28 @@ pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
                 if rn.net == net {
                     continue;
                 }
-                let cl = class_of(&classes, board, rn.net);
+                let oci = board.nets[rn.net].class.min(classes.len() - 1);
+                let cl = &classes[oci];
                 for seg in &rn.segs {
                     for w in seg.pts.windows(2) {
                         items.push(Item {
                             net: Some(rn.net),
+                            class: oci,
                             layer: Some(seg.layer),
                             a: w[0],
                             b: w[1],
                             half_width: seg.width / 2.0,
-                            clearance: cl.clearance,
                         });
                     }
                 }
                 for v in &rn.vias {
                     items.push(Item {
                         net: Some(rn.net),
+                        class: oci,
                         layer: None,
                         a: *v,
                         b: *v,
                         half_width: cl.via_diameter / 2.0,
-                        clearance: cl.clearance,
                     });
                 }
             }
@@ -130,7 +133,7 @@ pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
             let pads: Vec<(&Pad, f64)> = board
                 .pads
                 .iter()
-                .filter(|p| p.net != Some(net))
+                .filter(|p| p.net != Some(net) && !p.is_pour)
                 .map(|p| {
                     let pc = match p.net {
                         Some(n) => class_of(&classes, board, n).clearance,
@@ -160,8 +163,8 @@ pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
                         let a = pts[i];
                         let b = pts[j];
                         if candidate_clear(
-                            a, b, layer, hw, my_class, &items, &hash, &pads,
-                            &mut cand_ids, boundary_margin, &inside_boundary,
+                            a, b, layer, hw, my_ci, board, &classes, &items, &hash,
+                            &pads, &mut cand_ids, boundary_margin, &inside_boundary,
                         ) {
                             let cut = j - i - 1;
                             pts.drain(i + 1..j);
@@ -212,7 +215,9 @@ fn candidate_clear(
     b: P,
     layer: usize,
     hw: f64,
-    my_class: &NetClass,
+    my_ci: usize,
+    board: &Board,
+    classes: &[NetClass],
     items: &[Item],
     hash: &SpatialHash,
     pads: &[(&Pad, f64)],
@@ -220,8 +225,9 @@ fn candidate_clear(
     boundary_margin: f64,
     inside_boundary: &dyn Fn(P, f64) -> bool,
 ) -> bool {
+    let my_clearance = classes[my_ci].clearance;
     // Widest interaction reach we might need for the hash query.
-    let reach = hw + my_class.clearance + 2500.0;
+    let reach = hw + my_clearance + 2500.0;
     let (lo, hi) = seg_bbox(a, b, reach);
     hash.query(lo, hi, cand_ids);
     for &id in cand_ids.iter() {
@@ -231,7 +237,10 @@ fn candidate_clear(
                 continue;
             }
         }
-        let req = hw + it.half_width + my_class.clearance.max(it.clearance) + SAFETY;
+        let req = hw
+            + it.half_width
+            + pair_clearance(classes, &board.pair_clearances, my_ci, it.class)
+            + SAFETY;
         let d = crate::drc::seg_seg_distance(a, b, it.a, it.b);
         if d < req {
             return false;
@@ -244,7 +253,7 @@ fn candidate_clear(
         if !pad.layers.contains(&layer) {
             continue;
         }
-        let req = hw + my_class.clearance.max(*pad_clearance) + SAFETY;
+        let req = hw + my_clearance.max(*pad_clearance) + SAFETY;
         let (plo, phi) = pad.shape.bbox();
         let (clo, chi) = seg_bbox(a, b, req);
         if phi[0] < clo[0] || plo[0] > chi[0] || phi[1] < clo[1] || plo[1] > chi[1] {
