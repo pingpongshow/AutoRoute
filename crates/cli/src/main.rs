@@ -75,6 +75,15 @@ struct Args {
     #[arg(long)]
     dru: Option<PathBuf>,
 
+    /// Preferred layer directions, one char per layer: h, v, or a(ny),
+    /// e.g. "ahva". Default: inner layers alternate h/v.
+    #[arg(long)]
+    layer_dirs: Option<String>,
+
+    /// Skip the post-route taut-polyline refinement (any-angle straightening)
+    #[arg(long)]
+    no_refine: bool,
+
     /// Instead of routing, render an existing SES over the DSN to SVG
     #[arg(long, value_name = "SES")]
     render_ses: Option<PathBuf>,
@@ -275,6 +284,7 @@ fn main() {
         skip_classes: args.skip_classes.clone(),
         only_nets: args.nets.clone(),
         optimize_passes: args.optimize,
+        layer_dirs: args.layer_dirs.clone(),
         ..Default::default()
     };
     eprintln!("grid pitch: {:.0} um", cfg.effective_pitch(board));
@@ -294,6 +304,40 @@ fn main() {
         }
     });
     let dt = t0.elapsed();
+
+    let mut result = result;
+    if !args.no_refine {
+        let t1 = Instant::now();
+        let removed = autoroute_core::refine::refine(board, &mut result);
+        eprintln!(
+            "refine: {} vertices straightened in {:.2}s",
+            removed,
+            t1.elapsed().as_secs_f64()
+        );
+    }
+
+    // Differential-pair skew report.
+    {
+        let names: Vec<String> = board.nets.iter().map(|n| n.name.clone()).collect();
+        let pairs = autoroute_core::router::detect_pairs(&names);
+        for (i, p) in pairs.iter().enumerate() {
+            if let Some(j) = p {
+                if *j > i {
+                    let (a, b) = (&result.nets[i], &result.nets[*j]);
+                    if a.length > 0.0 && b.length > 0.0 {
+                        eprintln!(
+                            "pair {} / {}: lengths {:.2} / {:.2} mm, skew {:.2} mm",
+                            names[i],
+                            names[*j],
+                            a.length / 1000.0,
+                            b.length / 1000.0,
+                            (a.length - b.length).abs() / 1000.0
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let total_vias: usize = result.nets.iter().map(|n| n.vias.len()).sum();
     eprintln!(

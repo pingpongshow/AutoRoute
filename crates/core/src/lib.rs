@@ -5,6 +5,7 @@ pub mod board;
 pub mod drc;
 pub mod geometry;
 pub mod grid;
+pub mod refine;
 pub mod router;
 
 pub use board::{Board, Net, Pad, PadShape, Rules};

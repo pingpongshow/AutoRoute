@@ -29,6 +29,11 @@ pub struct Violation {
     pub kind: &'static str,
 }
 
+/// Distance between two segments (crate-internal helper for refinement).
+pub(crate) fn seg_seg_distance(a1: P, a2: P, b1: P, b2: P) -> f64 {
+    seg_seg_closest(a1, a2, b1, b2).0
+}
+
 /// Closest points between two segments: returns (distance, point on a, point on b).
 fn seg_seg_closest(a1: P, a2: P, b1: P, b2: P) -> (f64, P, P) {
     fn closest_on(p: P, a: P, b: P) -> P {

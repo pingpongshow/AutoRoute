@@ -41,6 +41,9 @@ pub struct RouterConfig {
     /// Post-completion cleanup passes: each routed net is rerouted alone and
     /// the new route kept only if it is strictly better (fewer vias/shorter).
     pub optimize_passes: usize,
+    /// Preferred routing direction per layer: 'h', 'v', or 'a' (any).
+    /// None = automatic (inner layers alternate h/v on 3+ layer boards).
+    pub layer_dirs: Option<String>,
 }
 
 impl Default for RouterConfig {
@@ -56,6 +59,7 @@ impl Default for RouterConfig {
             skip_classes: Vec::new(),
             only_nets: Vec::new(),
             optimize_passes: 1,
+            layer_dirs: None,
         }
     }
 }
@@ -89,6 +93,8 @@ pub struct RoutedNet {
     pub net: usize,
     pub segs: Vec<RouteSeg>,
     pub vias: Vec<P>,
+    /// Total routed track length, um.
+    pub length: f64,
     pub failed: bool,
     pub in_conflict: bool,
 }
@@ -174,19 +180,19 @@ const NO_CAME: u32 = u32::MAX;
 /// Stamp discs for one stamping class into every bucket's fields
 /// (each inner Vec is indexed by bucket).
 struct ClassDiscs {
-    /// Wire-entrant congestion, stamped by wires / vias.
-    wire_usage: Vec<Vec<(i32, i32)>>,
-    via_usage: Vec<Vec<(i32, i32)>>,
+    /// Wire-entrant congestion, stamped by wires / vias (row spans).
+    wire_usage: Vec<Vec<(i32, i32, i32)>>,
+    via_usage: Vec<Vec<(i32, i32, i32)>>,
     /// Via-entrant congestion, stamped by wires (orthogonal / diagonal cells)
     /// and vias.
-    wire_vusage: Vec<Vec<(i32, i32)>>,
-    wire_vusage_diag: Vec<Vec<(i32, i32)>>,
-    via_vusage: Vec<Vec<(i32, i32)>>,
+    wire_vusage: Vec<Vec<(i32, i32, i32)>>,
+    wire_vusage_diag: Vec<Vec<(i32, i32, i32)>>,
+    via_vusage: Vec<Vec<(i32, i32, i32)>>,
     /// Soft margin (one cell beyond the wire-entrant footprint).
-    wire_aura: Vec<Vec<(i32, i32)>>,
-    via_aura: Vec<Vec<(i32, i32)>>,
+    wire_aura: Vec<Vec<(i32, i32, i32)>>,
+    via_aura: Vec<Vec<(i32, i32, i32)>>,
     /// No-diagonal zone around vias.
-    via_tight: Vec<Vec<(i32, i32)>>,
+    via_tight: Vec<Vec<(i32, i32, i32)>>,
 }
 
 pub struct Router<'a> {
@@ -218,11 +224,15 @@ pub struct Router<'a> {
     /// History cost, shared across buckets (single plane).
     hist: Vec<f32>,
     /// Differential-pair partner per net (by name convention).
-    pairs: Vec<Option<usize>>,
+    pub pairs: Vec<Option<usize>>,
+    /// Per-layer (horizontal-move penalty, vertical-move penalty), um.
+    dir_pen: Vec<(f64, f64)>,
     /// Attraction counts (single plane): cells near an already-routed pair
     /// partner get a cost discount so the second net hugs the first.
     attract: Vec<u16>,
     attract_w: f64,
+    /// True while a pair partner's attraction field is stamped.
+    attract_on: bool,
     states: Vec<NetState>,
     /// Stamp discs indexed by stamping class.
     discs: Vec<ClassDiscs>,
@@ -274,16 +284,16 @@ impl<'a> Router<'a> {
                     let cc = k.clearance.max(bp.clearance);
                     let wb = bp.width / 2.0;
                     let vrb = bp.via_diameter / 2.0;
-                    cd.wire_usage.push(disc_offsets((wk + cc + wb) / pitch));
-                    cd.via_usage.push(disc_offsets((vrk + cc + wb) / pitch));
-                    cd.wire_vusage.push(disc_offsets((wk + cc + vrb) / pitch));
+                    cd.wire_usage.push(disc_spans((wk + cc + wb) / pitch));
+                    cd.via_usage.push(disc_spans((vrk + cc + wb) / pitch));
+                    cd.wire_vusage.push(disc_spans((wk + cc + vrb) / pitch));
                     cd.wire_vusage_diag
-                        .push(disc_offsets((wk + cc + vrb + quant) / pitch));
-                    cd.via_vusage.push(disc_offsets((vrk + cc + vrb) / pitch));
-                    cd.wire_aura.push(disc_offsets((wk + cc + wb) / pitch + 1.0));
-                    cd.via_aura.push(disc_offsets((vrk + cc + wb) / pitch + 1.0));
+                        .push(disc_spans((wk + cc + vrb + quant) / pitch));
+                    cd.via_vusage.push(disc_spans((vrk + cc + vrb) / pitch));
+                    cd.wire_aura.push(disc_spans((wk + cc + wb) / pitch + 1.0));
+                    cd.via_aura.push(disc_spans((vrk + cc + wb) / pitch + 1.0));
                     cd.via_tight
-                        .push(disc_offsets((vrk + cc + wb + quant) / pitch));
+                        .push(disc_spans((vrk + cc + wb + quant) / pitch));
                 }
                 cd
             })
@@ -299,6 +309,7 @@ impl<'a> Router<'a> {
             t.sort_unstable();
             t.dedup();
         }
+        let dir_pen = layer_dir_penalties(&cfg, grid.nl, pitch);
         let empty_state = NetState {
             stamp: vec![Vec::new(); nb],
             vstamp: vec![Vec::new(); nb],
@@ -321,8 +332,10 @@ impl<'a> Router<'a> {
             pairs: detect_pairs(
                 &board.nets.iter().map(|n| n.name.clone()).collect::<Vec<_>>(),
             ),
+            dir_pen,
             attract: vec![0; ncells],
             attract_w: 0.6 * pitch,
+            attract_on: false,
             states: vec![empty_state; nnets],
             discs,
             net_terms,
@@ -491,6 +504,9 @@ impl<'a> Router<'a> {
             };
         }
 
+        if !result.complete {
+            self.repair_clusters(cancel, &mut result);
+        }
         if self.cfg.optimize_passes > 0 && !cancel.load(AtomicOrdering::Relaxed) {
             self.optimize(&order, cancel, &mut result);
         }
@@ -560,11 +576,127 @@ impl<'a> Router<'a> {
                 self.attract[i] = self.attract[i].saturating_add(1);
             }
         }
+        self.attract_on = true;
         true
     }
 
     fn clear_attraction(&mut self) {
         self.attract.fill(0);
+        self.attract_on = false;
+    }
+
+    /// Local repair: conflicted nets often deadlock in pairs/small clusters
+    /// where the global negotiation's fixed order can't find the solution.
+    /// Rip up each cluster and retry it in several orders; keep the best.
+    fn repair_clusters(&mut self, cancel: &AtomicBool, result: &mut RouteResult) {
+        let conflicted: Vec<usize> = (0..self.states.len())
+            .filter(|&n| self.routable(n) && self.in_conflict(n))
+            .collect();
+        if conflicted.is_empty() {
+            return;
+        }
+        // Cluster nets that fight over the same cells (stamp covering another
+        // conflicted net's centerline, in either one's bucket).
+        let mut parent: Vec<usize> = (0..conflicted.len()).collect();
+        fn find(p: &mut Vec<usize>, i: usize) -> usize {
+            if p[i] != i {
+                let r = find(p, p[i]);
+                p[i] = r;
+            }
+            p[i]
+        }
+        for i in 0..conflicted.len() {
+            for j in (i + 1)..conflicted.len() {
+                let (n, m) = (conflicted[i], conflicted[j]);
+                let bn = self.net_bucket[n];
+                let overlap = self.states[n].centerline.iter().chain(&self.states[n].via_centers).any(|c| {
+                    self.states[m].stamp[bn].binary_search(c).is_ok()
+                        || self.states[m].vstamp[bn].binary_search(c).is_ok()
+                });
+                if overlap {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+        for i in 0..conflicted.len() {
+            let r = find(&mut parent, i);
+            clusters.entry(r).or_default().push(conflicted[i]);
+        }
+
+        for cluster in clusters.values() {
+            if cluster.len() < 2 || cluster.len() > 8 {
+                continue;
+            }
+            if cancel.load(AtomicOrdering::Relaxed) {
+                return;
+            }
+            let snapshot = |slf: &Self| -> Vec<(Vec<Leg>, bool)> {
+                cluster
+                    .iter()
+                    .map(|&n| (slf.states[n].legs.clone(), slf.states[n].routed))
+                    .collect()
+            };
+            let restore = |slf: &mut Self, snap: &[(Vec<Leg>, bool)]| {
+                for (&n, (legs, routed)) in cluster.iter().zip(snap.iter()) {
+                    slf.rip_up(n);
+                    for leg in legs.clone() {
+                        slf.commit_leg(n, leg);
+                    }
+                    slf.states[n].routed = *routed;
+                }
+            };
+            let count = |slf: &Self| -> usize {
+                cluster
+                    .iter()
+                    .filter(|&&n| slf.in_conflict(n) || !slf.states[n].routed)
+                    .count()
+            };
+
+            let original = snapshot(self);
+            let mut best_count = count(self);
+            let mut best_snap: Option<Vec<(Vec<Leg>, bool)>> = None;
+            let k = cluster.len();
+            let mut orders: Vec<Vec<usize>> = vec![{
+                let mut r = cluster.clone();
+                r.reverse();
+                r
+            }];
+            for rot in 1..k.min(4) {
+                let mut o = cluster.clone();
+                o.rotate_left(rot);
+                orders.push(o);
+            }
+            for ord in orders {
+                for &n in &ord {
+                    self.rip_up(n);
+                }
+                for &n in &ord {
+                    self.route_net(n);
+                }
+                let c = count(self);
+                if c < best_count {
+                    best_count = c;
+                    best_snap = Some(snapshot(self));
+                    if c == 0 {
+                        break;
+                    }
+                }
+                restore(self, &original);
+            }
+            if let Some(snap) = best_snap {
+                restore(self, &snap);
+                for &n in cluster.iter() {
+                    let idx = n;
+                    let mut rn = std::mem::take(&mut result.nets[idx]);
+                    rn.net = idx;
+                    self.extract_geometry(idx, &mut rn);
+                    rn.in_conflict = self.in_conflict(idx);
+                    result.nets[idx] = rn;
+                }
+            }
+        }
     }
 
     /// Cleanup: reroute each net alone against the final board state; keep
@@ -763,7 +895,19 @@ impl<'a> Router<'a> {
             let pad_local = remaining.remove(ri);
             let target_cells = self.pad_cells[pads[pad_local]].clone();
 
-            match self.astar(n as i32, self.net_bucket[n], &tree, &target_cells) {
+            // Try a window around sources+targets first; a full-grid sweep
+            // only when the local search fails.
+            let window = self.search_window(&tree, &target_cells, 64);
+            let attempt = self
+                .astar(n as i32, self.net_bucket[n], &tree, &target_cells, window)
+                .or_else(|| {
+                    if window.is_some() {
+                        self.astar(n as i32, self.net_bucket[n], &tree, &target_cells, None)
+                    } else {
+                        None
+                    }
+                });
+            match attempt {
                 Some(path) => {
                     // Commit only after every leg is routed: a net is allowed
                     // to run close to itself, so its own earlier legs must not
@@ -798,6 +942,38 @@ impl<'a> Router<'a> {
 
     /// Commit one leg: record wire centerlines and via barrels, and stamp the
     /// wire-entrant, via-entrant, and soft-margin fields.
+    /// Bounding window (inflated by `margin` cells) around two cell sets.
+    fn search_window(
+        &self,
+        a: &[u32],
+        b: &[u32],
+        margin: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let mut x0 = usize::MAX;
+        let mut x1 = 0usize;
+        let mut y0 = usize::MAX;
+        let mut y1 = 0usize;
+        for &c in a.iter().chain(b.iter()) {
+            let (_, x, y) = self.grid.decompose(c);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+        if x0 == usize::MAX {
+            return None;
+        }
+        let wx0 = x0.saturating_sub(margin);
+        let wy0 = y0.saturating_sub(margin);
+        let wx1 = (x1 + margin).min(self.grid.nx - 1);
+        let wy1 = (y1 + margin).min(self.grid.ny - 1);
+        // A window covering nearly the whole grid buys nothing.
+        if (wx1 - wx0) * (wy1 - wy0) * 2 > self.grid.nx * self.grid.ny {
+            return None;
+        }
+        Some((wx0, wx1, wy0, wy1))
+    }
+
     fn commit_leg(&mut self, n: usize, leg: Leg) {
         let path: &[u32] = &leg.cells;
         let nb = self.grid.buckets.len();
@@ -849,14 +1025,20 @@ impl<'a> Router<'a> {
                 let mut vs: Vec<u32> = Vec::new();
                 let mut au: Vec<u32> = Vec::new();
                 let mut vt: Vec<u32> = Vec::new();
-                let push_disc = |list: &mut Vec<u32>, ll: usize, x: usize, y: usize, d: &[(i32, i32)]| {
-                    for &(dx, dy) in d {
-                        let nx = x as i32 + dx;
+                // Push whole contiguous cell runs per disc row.
+                let push_disc = |list: &mut Vec<u32>, ll: usize, x: usize, y: usize, d: &[(i32, i32, i32)]| {
+                    for &(dy, sx0, sx1) in d {
                         let ny = y as i32 + dy;
-                        if nx < 0 || ny < 0 || nx as usize >= nx_max || ny as usize >= ny_max {
+                        if ny < 0 || ny >= ny_max as i32 {
                             continue;
                         }
-                        list.push(grid.idx(ll, nx as usize, ny as usize));
+                        let a = (x as i32 + sx0).max(0);
+                        let b = (x as i32 + sx1).min(nx_max as i32 - 1);
+                        if b < a {
+                            continue;
+                        }
+                        let base = grid.idx(ll, 0, ny as usize);
+                        list.extend(base + a as u32..=base + b as u32);
                     }
                 };
                 for &(kind, l, x, y) in &cells_info {
@@ -917,7 +1099,14 @@ impl<'a> Router<'a> {
     }
 
     /// Multi-source, multi-target A* for net `net`.
-    fn astar(&mut self, net: i32, bucket: usize, sources: &[u32], targets: &[u32]) -> Option<Vec<u32>> {
+    fn astar(
+        &mut self,
+        net: i32,
+        bucket: usize,
+        sources: &[u32],
+        targets: &[u32],
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> Option<Vec<u32>> {
         let grid = &self.grid;
         let bo = bucket * grid.ncells;
         let s = &mut self.search;
@@ -1021,6 +1210,11 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 let (nxu, nyu) = (nx as usize, ny as usize);
+                if let Some((wx0, wx1, wy0, wy1)) = window {
+                    if nxu < wx0 || nxu > wx1 || nyu < wy0 || nyu > wy1 {
+                        continue;
+                    }
+                }
                 let ncell = grid.idx(l, nxu, nyu);
                 if !grid.passable(bucket, ncell, net) {
                     continue;
@@ -1044,14 +1238,26 @@ impl<'a> Router<'a> {
                     }
                 }
                 let step = if dx != 0 && dy != 0 { diag } else { pitch };
-                // Differential-pair attraction: discount cells near the
-                // routed partner (never below a fraction of the step, so
-                // costs stay positive).
-                let bonus = (self.attract[ncell as usize] as f64 * self.attract_w)
-                    .min(step * 0.8);
+                // Preferred-direction penalty for this layer (diagonals pay half).
+                let (hp, vp) = self.dir_pen[l];
+                let dpen = if dx != 0 && dy != 0 {
+                    (hp + vp) * 0.5
+                } else if dx != 0 {
+                    hp
+                } else {
+                    vp
+                };
+                // Differential-pair coupling: discount cells near the routed
+                // partner (never below a fraction of the step, so costs stay
+                // positive) and mildly penalize leaving the corridor.
+                let a = self.attract[ncell as usize] as f64;
+                let bonus = (a * self.attract_w).min(step * 0.8);
+                let corridor = if self.attract_on && a == 0.0 { 1.2 * pitch } else { 0.0 };
                 let mut ng = gc
                     + step
+                    + dpen
                     - bonus
+                    + corridor
                     + self.hist[ncell as usize] as f64
                     + self.usage[bo + ncell as usize] as f64 * self.p_fac
                     + self.aura[bo + ncell as usize] as f64 * self.aura_w;
@@ -1198,6 +1404,16 @@ impl<'a> Router<'a> {
         // Dedup vias (same location reached by multiple legs).
         out.vias.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
         out.vias.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6);
+        out.length = out
+            .segs
+            .iter()
+            .map(|s| {
+                s.pts
+                    .windows(2)
+                    .map(|w| ((w[0][0] - w[1][0]).powi(2) + (w[0][1] - w[1][1]).powi(2)).sqrt())
+                    .sum::<f64>()
+            })
+            .sum();
     }
 }
 
@@ -1318,7 +1534,7 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 
 /// Detect differential pairs by KiCad naming conventions: names differing
 /// only by a trailing +/- or _P/_N. Returns partner index per net.
-fn detect_pairs(names: &[String]) -> Vec<Option<usize>> {
+pub fn detect_pairs(names: &[String]) -> Vec<Option<usize>> {
     use std::collections::HashMap;
     let mut partner = vec![None; names.len()];
     let mut by_base: HashMap<(String, bool), usize> = HashMap::new();
@@ -1390,6 +1606,48 @@ fn simplify(grid: &Grid, cells: &[u32]) -> Vec<P> {
         last_xy = Some(xy);
     }
     pts
+}
+
+/// Per-layer (h-move, v-move) penalties from the layer-direction config.
+fn layer_dir_penalties(cfg: &RouterConfig, nl: usize, pitch: f64) -> Vec<(f64, f64)> {
+    let pen = 0.35 * pitch;
+    let dirs: Vec<char> = match &cfg.layer_dirs {
+        Some(s) => s.chars().take(nl).collect(),
+        None => (0..nl)
+            .map(|l| {
+                // Outer layers unconstrained; inner layers alternate h/v.
+                if nl > 2 && l > 0 && l + 1 < nl {
+                    if (l - 1) % 2 == 0 { 'h' } else { 'v' }
+                } else {
+                    'a'
+                }
+            })
+            .collect(),
+    };
+    (0..nl)
+        .map(|l| match dirs.get(l).copied().unwrap_or('a') {
+            'h' | 'H' => (0.0, pen), // horizontal preferred: penalize vertical
+            'v' | 'V' => (pen, 0.0),
+            _ => (0.0, 0.0),
+        })
+        .collect()
+}
+
+/// Row spans of a filled disc: (dy, xmin, xmax) per row — lets stamping push
+/// whole contiguous cell runs at once.
+fn disc_spans(r: f64) -> Vec<(i32, i32, i32)> {
+    let ri = r.ceil() as i32;
+    let r2 = r * r;
+    let mut v = Vec::new();
+    for dy in -ri..=ri {
+        let rem = r2 - (dy * dy) as f64 + 1e-9;
+        if rem < 0.0 {
+            continue;
+        }
+        let dx = rem.sqrt().floor() as i32;
+        v.push((dy, -dx, dx));
+    }
+    v
 }
 
 /// Integer offsets of a filled disc of radius `r` (in cells).
