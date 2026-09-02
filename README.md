@@ -88,8 +88,10 @@ radius to foreign copper on every layer) — including under IC bodies and in
 fanout moats — while wire clearances are only enforced on the layers the
 wire actually runs.
 
-**Copper pours**: nets with a zone/pour are left to the pour (KiCad exports
-them as Specctra planes); footprint and board keepouts become hard obstacles.
+**Copper pours**: zones (KiCad exports them as Specctra planes) become
+routable pour regions — pads not already inside the pour are stitched to it
+with stubs and vias, and pours never block other nets (they refill around
+foreign copper). Footprint and board keepouts become hard obstacles.
 `--reroute-wired` also disables this.
 
 **Differential pairs** (names ending `+`/`-` or `_P`/`_N`) are detected
@@ -104,12 +106,23 @@ the new route kept only when it is strictly better (fewer vias, then shorter)
 **Selective routing**: `--nets 'ETH_*,/RX*'` routes only matching nets
 (`*` wildcard). Complements `--skip-classes`.
 
-**.kicad_dru**: simple unconditional minimums (clearance, track width) are
-applied automatically when a `.kicad_dru` sits next to the input board
-(or pass `--dru FILE`); conditional rules are reported and ignored.
+**.kicad_dru**: unconditional minimums (clearance, track width) and
+conditional netclass-pair clearance rules
+(`A.NetClass == 'X' && B.NetClass == 'Y'`) are applied automatically when a
+`.kicad_dru` sits next to the input board (or pass `--dru FILE`); other rule
+shapes are reported and ignored.
 
-Grid rasterization, footprint stamping, and the DRC run multi-threaded
-(rayon).
+**Refinement**: after routing, every polyline is pulled taut — staircase
+grid runs become straight any-angle segments wherever the exact geometry
+clears all other copper (`--no-refine` to disable). Combined with per-layer
+preferred directions (`--layer-dirs`, auto h/v on inner layers), output
+approaches hand-routed appearance.
+
+**Performance**: the first routing iteration plans spatially disjoint nets
+in parallel; grid rasterization, footprint stamping, and the DRC are also
+multi-threaded (rayon). Searches run in a local window first, escalating to
+the full grid only on failure; stuck conflict clusters are retried in
+alternative orders (local repair).
 
 ### GUI
 
@@ -117,9 +130,11 @@ Grid rasterization, footprint stamping, and the DRC run multi-threaded
 autoroute-gui [board.dsn]
 ```
 
-Open a DSN, press **Route**, and watch the router negotiate in real time
-(conflicted nets flash magenta). Layer visibility toggles, pan (drag), zoom
-(scroll/pinch), SES export.
+Open a DSN or .kicad_pcb, press **Route**, and watch the router negotiate in
+real time (conflicted nets flash magenta). Layer visibility toggles, pan
+(drag), zoom (scroll/pinch), net glob highlighting, ratsnest overlay for
+unrouted nets, a DRC panel (click a violation to jump to it), SES export,
+and routed-.kicad_pcb export.
 
 ## How it works
 

@@ -35,6 +35,7 @@ fn main() -> eframe::Result {
 #[derive(Clone, Default)]
 struct Shared {
     result: Option<RouteResult>,
+    violations: Vec<autoroute_core::drc::Violation>,
     status: String,
     running: bool,
 }
@@ -54,6 +55,12 @@ struct App {
     grid_pitch: String,
     status: String,
     show_layers: Vec<bool>,
+    /// Net-name filter ("*" glob); matching nets highlighted, rest dimmed.
+    net_filter: String,
+    show_ratsnest: bool,
+    /// World point to center on next frame (from clicking a DRC row).
+    goto_point: Option<[f64; 2]>,
+    show_drc_panel: bool,
 }
 
 const LAYER_COLORS: [Color32; 6] = [
@@ -163,7 +170,19 @@ impl App {
                     last_push = Instant::now();
                 }
             });
+            let mut result = result;
+            if !cancel.load(Ordering::Relaxed) {
+                autoroute_core::refine::refine(&board, &mut result);
+            }
+            let violations = {
+                let tol = 5.0;
+                let mut v = autoroute_core::drc::check(&board, &result, tol);
+                v.extend(autoroute_core::drc::check_pads(&board, &result, tol));
+                v.extend(autoroute_core::drc::check_via_pads(&board, &result, tol));
+                v
+            };
             let mut sh = shared.lock().unwrap();
+            sh.violations = violations;
             let vias: usize = result.nets.iter().map(|n| n.vias.len()).sum();
             sh.status = if cancel.load(Ordering::Relaxed) {
                 "stopped".to_string()
@@ -272,8 +291,23 @@ impl App {
         )
     }
 
-    fn draw_board(&self, painter: &egui::Painter, board: &Board, result: Option<&RouteResult>) {
+    fn draw_board(
+        &self,
+        painter: &egui::Painter,
+        board: &Board,
+        result: Option<&RouteResult>,
+        violations: &[autoroute_core::drc::Violation],
+    ) {
         let z = self.zoom;
+        let filter = self.net_filter.trim().to_string();
+        let net_dim = |net: usize| -> bool {
+            !filter.is_empty()
+                && !board
+                    .nets
+                    .get(net)
+                    .map(|n| autoroute_core::router::glob_match(&filter, &n.name))
+                    .unwrap_or(false)
+        };
         // Boundary.
         if board.boundary.len() >= 2 {
             let mut pts: Vec<Pos2> = board.boundary.iter().map(|p| self.to_screen(*p)).collect();
@@ -296,6 +330,9 @@ impl App {
                     let mut color = layer_color(seg.layer);
                     if rn.in_conflict {
                         color = Color32::from_rgb(255, 40, 220);
+                    }
+                    if net_dim(rn.net) {
+                        color = color.gamma_multiply(0.15);
                     }
                     let stroke = Stroke::new((seg.width as f32 * z).max(1.0), color);
                     let pts: Vec<Pos2> = seg.pts.iter().map(|p| self.to_screen(*p)).collect();
@@ -349,6 +386,38 @@ impl App {
                     ));
                 }
             }
+        }
+
+        // Ratsnest: chain pad centers of nets with no routed geometry.
+        if self.show_ratsnest {
+            let ghost = Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 90));
+            for (ni, net) in board.nets.iter().enumerate() {
+                if net.fixed || net.pads.len() < 2 {
+                    continue;
+                }
+                let routed = result
+                    .and_then(|r| r.nets.get(ni))
+                    .map(|rn| !rn.segs.is_empty())
+                    .unwrap_or(false);
+                if routed {
+                    continue;
+                }
+                let centers: Vec<Pos2> = net
+                    .pads
+                    .iter()
+                    .filter(|&&pi| !board.pads[pi].is_pour)
+                    .map(|&pi| self.to_screen(board.pads[pi].shape.center()))
+                    .collect();
+                for w in centers.windows(2) {
+                    painter.line_segment([w[0], w[1]], ghost);
+                }
+            }
+        }
+
+        // DRC violation markers.
+        for v in violations {
+            let c = self.to_screen(v.at);
+            painter.circle_stroke(c, 7.0, Stroke::new(2.0, Color32::from_rgb(255, 60, 60)));
         }
     }
 }
@@ -404,6 +473,12 @@ impl eframe::App for App {
                     self.fitted = false;
                 }
                 ui.separator();
+                ui.label("net:");
+                ui.add(egui::TextEdit::singleline(&mut self.net_filter).desired_width(90.0))
+                    .on_hover_text("Highlight nets matching this glob (e.g. ETH_*)");
+                ui.checkbox(&mut self.show_ratsnest, "ratsnest");
+                ui.checkbox(&mut self.show_drc_panel, "DRC");
+                ui.separator();
                 if let Some(board) = &self.board {
                     let names: Vec<String> = board.layers.clone();
                     for (l, name) in names.iter().enumerate() {
@@ -430,6 +505,38 @@ impl eframe::App for App {
             });
         });
 
+        if self.show_drc_panel {
+            egui::SidePanel::right("drc").min_width(230.0).show(ctx, |ui| {
+                ui.heading(format!("DRC: {}", shared_snapshot.violations.len()));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let board = self.board.clone();
+                    for v in shared_snapshot.violations.iter() {
+                        let name = |n: usize| {
+                            board
+                                .as_ref()
+                                .and_then(|b| b.nets.get(n))
+                                .map(|nn| nn.name.clone())
+                                .unwrap_or_else(|| "?".into())
+                        };
+                        let label = format!(
+                            "{} {} / {}\n  gap {:.0} < {:.0} um",
+                            v.kind,
+                            name(v.net_a),
+                            name(v.net_b),
+                            v.gap,
+                            v.required
+                        );
+                        if ui.selectable_label(false, label).clicked() {
+                            self.goto_point = Some(v.at);
+                        }
+                    }
+                    if shared_snapshot.violations.is_empty() {
+                        ui.label("clean");
+                    }
+                });
+            });
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(24, 26, 30)))
             .show(ctx, |ui| {
@@ -440,6 +547,11 @@ impl eframe::App for App {
                 if let Some(board) = self.board.clone() {
                     if !self.fitted {
                         self.fit_view(&board, rect);
+                    }
+                    if let Some(gp) = self.goto_point.take() {
+                        self.zoom = self.zoom.max(0.05);
+                        self.pan = rect.center().to_vec2()
+                            - Vec2::new(gp[0] as f32 * self.zoom, -(gp[1] as f32) * self.zoom);
                     }
                     // Pan.
                     if response.dragged() {
@@ -461,7 +573,12 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    self.draw_board(&painter, &board, shared_snapshot.result.as_ref());
+                    self.draw_board(
+                        &painter,
+                        &board,
+                        shared_snapshot.result.as_ref(),
+                        &shared_snapshot.violations,
+                    );
                 } else {
                     painter.text(
                         rect.center(),
