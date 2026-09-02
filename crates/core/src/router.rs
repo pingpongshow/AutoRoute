@@ -157,6 +157,19 @@ struct Search {
     cur_tgen: u32,
 }
 
+impl Search {
+    fn new(ncells: usize) -> Search {
+        Search {
+            g: vec![0.0; ncells],
+            gen: vec![0; ncells],
+            came: vec![NO_CAME; ncells],
+            tgen: vec![0; ncells],
+            cur_gen: 0,
+            cur_tgen: 0,
+        }
+    }
+}
+
 #[derive(PartialEq)]
 struct HeapEntry {
     f: f64,
@@ -341,14 +354,7 @@ impl<'a> Router<'a> {
             net_terms,
             p_fac: 0.0,
             aura_w: 0.35 * pitch,
-            search: Search {
-                g: vec![0.0; ncells],
-                gen: vec![0; ncells],
-                came: vec![NO_CAME; ncells],
-                tgen: vec![0; ncells],
-                cur_gen: 0,
-                cur_tgen: 0,
-            },
+            search: Search::new(ncells),
         }
     }
 
@@ -421,34 +427,148 @@ impl<'a> Router<'a> {
 
             // Rip up and reroute one net at a time, so each rerouted net sees
             // the present congestion of every other net (PathFinder style).
+            // The first iteration starts from an empty board, so spatially
+            // disjoint nets can be PLANNED in parallel and committed serially.
             let mut done = 0usize;
-            for &n in &targets {
-                if cancel.load(AtomicOrdering::Relaxed) {
-                    self.finalize(&mut result);
-                    return result;
+            if iter == 0 && targets.len() > 8 {
+                // Pair "seconds" stay serial so they can be attracted to their
+                // already-routed partner.
+                let mut first_seen: Vec<bool> = vec![false; self.board.nets.len()];
+                let mut pool: Vec<usize> = Vec::new();
+                let mut tail: Vec<usize> = Vec::new();
+                for &n in &targets {
+                    if let Some(m) = self.pairs[n] {
+                        if first_seen[m] {
+                            tail.push(n);
+                            continue;
+                        }
+                    }
+                    first_seen[n] = true;
+                    pool.push(n);
                 }
-                // A net that failed outright (no path exists at any price)
-                // will keep failing until the board around it changes; probing
-                // it every iteration costs a full-grid search each time, so
-                // only retry failed-but-unconflicted nets every 4th iteration.
-                if iter > 0 && !self.states[n].routed && iter % 4 != 0 && !self.in_conflict(n) {
-                    continue;
+                // Greedy waves of nets whose inflated cell-bboxes are disjoint.
+                let margin = 64i64;
+                let bbox_of = |slf: &Self, n: usize| -> (i64, i64, i64, i64) {
+                    let mut b = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+                    for &pi in &slf.board.nets[n].pads {
+                        for &c in &slf.pad_cells[pi] {
+                            let (_, x, y) = slf.grid.decompose(c);
+                            b.0 = b.0.min(x as i64);
+                            b.1 = b.1.max(x as i64);
+                            b.2 = b.2.min(y as i64);
+                            b.3 = b.3.max(y as i64);
+                        }
+                    }
+                    (b.0 - margin, b.1 + margin, b.2 - margin, b.3 + margin)
+                };
+                let boxes: Vec<(i64, i64, i64, i64)> =
+                    pool.iter().map(|&n| bbox_of(self, n)).collect();
+                let mut assigned = vec![false; pool.len()];
+                let mut waves: Vec<Vec<usize>> = Vec::new();
+                for i in 0..pool.len() {
+                    if assigned[i] {
+                        continue;
+                    }
+                    let mut wave = vec![i];
+                    assigned[i] = true;
+                    'cand: for j in (i + 1)..pool.len() {
+                        if assigned[j] {
+                            continue;
+                        }
+                        for &k in &wave {
+                            let (a, b) = (&boxes[k], &boxes[j]);
+                            let overlap =
+                                a.0 <= b.1 && b.0 <= a.1 && a.2 <= b.3 && b.2 <= a.3;
+                            if overlap {
+                                continue 'cand;
+                            }
+                        }
+                        wave.push(j);
+                        assigned[j] = true;
+                    }
+                    waves.push(wave);
                 }
-                self.rip_up(n);
-                let attracted = self.stamp_attraction(n);
-                self.route_net(n);
-                if attracted {
-                    self.clear_attraction();
+                let ncells = self.grid.ncells;
+                for wave in waves {
+                    if cancel.load(AtomicOrdering::Relaxed) {
+                        self.finalize(&mut result);
+                        return result;
+                    }
+                    let this: &Self = self;
+                    let plans: Vec<(usize, Vec<Leg>, bool)> = wave
+                        .par_iter()
+                        .map_init(
+                            || Search::new(ncells),
+                            |s, &pi| {
+                                let n = pool[pi];
+                                let (legs, ok) = this.plan_net(n, s);
+                                (n, legs, ok)
+                            },
+                        )
+                        .collect();
+                    for (n, legs, ok) in plans {
+                        self.commit_net(n, legs, ok);
+                        self.extract_geometry(n, &mut result.nets[n]);
+                        done += 1;
+                        progress(&Progress {
+                            iteration: iter,
+                            nets_done: done,
+                            nets_total: total,
+                            end_of_iteration: false,
+                            result: &result,
+                        });
+                    }
                 }
-                self.extract_geometry(n, &mut result.nets[n]);
-                done += 1;
-                progress(&Progress {
-                    iteration: iter,
-                    nets_done: done,
-                    nets_total: total,
-                    end_of_iteration: false,
-                    result: &result,
-                });
+                for n in tail {
+                    if cancel.load(AtomicOrdering::Relaxed) {
+                        self.finalize(&mut result);
+                        return result;
+                    }
+                    let attracted = self.stamp_attraction(n);
+                    self.route_net(n);
+                    if attracted {
+                        self.clear_attraction();
+                    }
+                    self.extract_geometry(n, &mut result.nets[n]);
+                    done += 1;
+                    progress(&Progress {
+                        iteration: iter,
+                        nets_done: done,
+                        nets_total: total,
+                        end_of_iteration: false,
+                        result: &result,
+                    });
+                }
+            } else {
+                for &n in &targets {
+                    if cancel.load(AtomicOrdering::Relaxed) {
+                        self.finalize(&mut result);
+                        return result;
+                    }
+                    // A net that failed outright (no path exists at any price)
+                    // will keep failing until the board around it changes;
+                    // probing it every iteration costs a full-grid search each
+                    // time, so only retry failed-but-unconflicted nets every
+                    // 4th iteration.
+                    if iter > 0 && !self.states[n].routed && iter % 4 != 0 && !self.in_conflict(n) {
+                        continue;
+                    }
+                    self.rip_up(n);
+                    let attracted = self.stamp_attraction(n);
+                    self.route_net(n);
+                    if attracted {
+                        self.clear_attraction();
+                    }
+                    self.extract_geometry(n, &mut result.nets[n]);
+                    done += 1;
+                    progress(&Progress {
+                        iteration: iter,
+                        nets_done: done,
+                        nets_total: total,
+                        end_of_iteration: false,
+                        result: &result,
+                    });
+                }
             }
 
             // Find conflicted or failed nets for the next round.
@@ -849,10 +969,24 @@ impl<'a> Router<'a> {
 
     /// Route one net: greedy incremental Steiner tree over its pads.
     fn route_net(&mut self, n: usize) {
+        let mut search = std::mem::replace(&mut self.search, Search::new(0));
+        let (legs, ok) = self.plan_net(n, &mut search);
+        self.search = search;
+        self.commit_net(n, legs, ok);
+    }
+
+    fn commit_net(&mut self, n: usize, legs: Vec<Leg>, ok: bool) {
+        for leg in legs {
+            self.commit_leg(n, leg);
+        }
+        self.states[n].routed = ok;
+    }
+
+    /// Plan a net's route without touching shared state (parallel-safe).
+    fn plan_net(&self, n: usize, search: &mut Search) -> (Vec<Leg>, bool) {
         let pads: Vec<usize> = self.board.nets[n].pads.clone();
         if pads.len() < 2 {
-            self.states[n].routed = true;
-            return;
+            return (Vec::new(), true);
         }
 
         // Start from the pad closest to the net centroid.
@@ -899,10 +1033,10 @@ impl<'a> Router<'a> {
             // only when the local search fails.
             let window = self.search_window(&tree, &target_cells, 64);
             let attempt = self
-                .astar(n as i32, self.net_bucket[n], &tree, &target_cells, window)
+                .astar(search, n as i32, self.net_bucket[n], &tree, &target_cells, window)
                 .or_else(|| {
                     if window.is_some() {
-                        self.astar(n as i32, self.net_bucket[n], &tree, &target_cells, None)
+                        self.astar(search, n as i32, self.net_bucket[n], &tree, &target_cells, None)
                     } else {
                         None
                     }
@@ -934,10 +1068,7 @@ impl<'a> Router<'a> {
                 }
             }
         }
-        for leg in legs {
-            self.commit_leg(n, leg);
-        }
-        self.states[n].routed = ok;
+        (legs, ok)
     }
 
     /// Commit one leg: record wire centerlines and via barrels, and stamp the
@@ -1100,7 +1231,8 @@ impl<'a> Router<'a> {
 
     /// Multi-source, multi-target A* for net `net`.
     fn astar(
-        &mut self,
+        &self,
+        s: &mut Search,
         net: i32,
         bucket: usize,
         sources: &[u32],
@@ -1109,7 +1241,6 @@ impl<'a> Router<'a> {
     ) -> Option<Vec<u32>> {
         let grid = &self.grid;
         let bo = bucket * grid.ncells;
-        let s = &mut self.search;
         s.cur_gen = s.cur_gen.wrapping_add(1);
         s.cur_tgen = s.cur_tgen.wrapping_add(1);
         let pitch = grid.pitch;
