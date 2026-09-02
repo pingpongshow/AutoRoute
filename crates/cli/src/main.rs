@@ -315,7 +315,7 @@ fn main() {
         );
     }
     if parsed.poured_nets > 0 {
-        eprintln!("leaving {} nets to their copper pours", parsed.poured_nets);
+        eprintln!("stitching {} pour nets into their zones", parsed.poured_nets);
     }
 
     let cfg = RouterConfig {
