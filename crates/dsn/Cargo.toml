@@ -1,0 +1,11 @@
+[package]
+name = "autoroute-dsn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "autoroute_dsn"
+
+[dependencies]
+autoroute-core = { path = "../core" }

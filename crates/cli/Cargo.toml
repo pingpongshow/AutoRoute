@@ -1,0 +1,14 @@
+[package]
+name = "autoroute-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autoroute"
+path = "src/main.rs"
+
+[dependencies]
+autoroute-core = { path = "../core" }
+autoroute-dsn = { path = "../dsn" }
+clap = { version = "4", features = ["derive"] }

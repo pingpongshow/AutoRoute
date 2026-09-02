@@ -1,0 +1,11 @@
+[package]
+name = "autoroute-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rayon = "1"
+
+[lib]
+name = "autoroute_core"

@@ -1,0 +1,15 @@
+[package]
+name = "autoroute-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autoroute-gui"
+path = "src/main.rs"
+
+[dependencies]
+autoroute-core = { path = "../core" }
+autoroute-dsn = { path = "../dsn" }
+eframe = "0.32"
+rfd = "0.15"

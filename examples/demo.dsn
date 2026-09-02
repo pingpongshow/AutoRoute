@@ -1,0 +1,48 @@
+(pcb "demo.dsn"
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu (type signal) (property (index 0)))
+    (layer B.Cu (type signal) (property (index 1)))
+    (boundary
+      (path pcb 0 0 0 30000 0 30000 -20000 0 -20000 0 0)
+    )
+    (via "Via[0-1]_800:400_um")
+    (rule (width 250) (clearance 200.1))
+  )
+  (placement
+    (component "R_0805"
+      (place R1 4000 -4000 front 0 (PN 10k))
+      (place R2 4000 -16000 front 90 (PN 22k))
+      (place R3 26000 -4000 front 0 (PN 1k))
+      (place R4 26000 -16000 front 90 (PN 4k7))
+    )
+  )
+  (library
+    (image "R_0805"
+      (pin RoundRect[T]Pad_1025x1400_um 1 -937.5 0)
+      (pin RoundRect[T]Pad_1025x1400_um 2 937.5 0)
+    )
+    (padstack RoundRect[T]Pad_1025x1400_um
+      (shape (rect F.Cu -512.5 -700 512.5 700))
+      (attach off)
+    )
+    (padstack "Via[0-1]_800:400_um"
+      (shape (circle F.Cu 800 0 0))
+      (shape (circle B.Cu 800 0 0))
+      (attach off)
+    )
+  )
+  (network
+    (net "N1" (pins R1-2 R4-1))
+    (net "N2" (pins R2-1 R3-2))
+    (net "N3" (pins R1-1 R2-2))
+    (net "N4" (pins R3-1 R4-2))
+  )
+  (wiring)
+)
