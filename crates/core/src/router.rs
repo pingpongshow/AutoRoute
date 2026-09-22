@@ -28,6 +28,18 @@ pub struct RouterConfig {
     pub turn_penalty: f64,
     /// History cost added to contested cells each iteration, in grid pitches.
     pub history_increment: f64,
+    /// Per-iteration decay applied to the history field before new charges are added. Without it
+    /// history grows without bound and old contention outweighs present reality.
+    pub history_decay: f64,
+    /// Floor on pad-entry necking, as a fraction of the net class's track width. `emit_necked`
+    /// narrows a track to its terminal pad's short side so a fat trace does not overhang into
+    /// neighbouring fine-pitch pins -- correct in principle, but with no floor it pinched BAT_N
+    /// from 1.5 mm to 0.230 mm and VSYS to 0.600 mm, turning a 3 A rail into a 0.8 A one. At 1.0
+    /// necking is off entirely and every track keeps its class width.
+    pub neck_floor: f64,
+    /// Forbid via barrels inside any pad, including the via's own net. Costs escape options at
+    /// fine-pitch parts; buys a board with no bare barrels in solderable pads.
+    pub no_via_in_pad: bool,
     /// Present-congestion price growth factor per iteration.
     pub present_growth: f64,
     /// Present-congestion price cap, in grid pitches.
@@ -51,9 +63,19 @@ impl Default for RouterConfig {
         RouterConfig {
             pitch: None,
             max_iterations: 40,
-            via_cost: 5000.0,
+            // A via is worth about 1.8 mm of track here, not 5. At 5000 um a pair of vias cost
+            // 10 mm, so a 10 mm surface detour looked cheaper than dropping to an inner layer --
+            // which is why a six-layer board came back with its long hauls all on F.Cu.
+            via_cost: 1800.0,
             turn_penalty: 60.0,
-            history_increment: 1.5,
+            // 1.5 x pitch per iteration, never decayed, reached 21x a normal cell's cost by
+            // iteration 14. A path crossing thirty such cells paid 134 mm of penalty, so nets
+            // detoured most of the way round the board through empty space rather than cross a
+            // corridor that had been contested once, eight iterations earlier.
+            history_increment: 0.3,
+            history_decay: 0.85,
+            neck_floor: 0.0,
+            no_via_in_pad: false,
             present_growth: 2.0,
             present_cap: 120.0,
             skip_classes: Vec::new(),
@@ -261,7 +283,7 @@ pub struct Router<'a> {
 impl<'a> Router<'a> {
     pub fn new(board: &'a Board, cfg: RouterConfig) -> Router<'a> {
         let pitch = cfg.effective_pitch(board);
-        let (grid, pad_cells) = Grid::build(board, pitch);
+        let (grid, pad_cells) = Grid::build(board, pitch, cfg.no_via_in_pad);
         let ncells = grid.ncells;
         let nb = grid.buckets.len();
         let classes = effective_classes(board);
@@ -616,10 +638,23 @@ impl<'a> Router<'a> {
 
             // Charge history on contested cells (any bucket); raise the
             // present-sharing price.
+            //
+            // Via contention counts too. `in_conflict` flags a net when EITHER usage (wires) or
+            // vusage (vias) is doubled up, so charging history on `usage` alone leaves a via-vs-via
+            // deadlock with no accumulating pressure at all. Present cost is then the only force on
+            // it, and that saturates at `present_cap` after ~8 iterations -- after which the cost
+            // function is frozen and the negotiation provably cannot break the tie. On the GPR main
+            // board that was exactly 4 nets stuck from iteration 8 through 14.
             let ncells = self.grid.ncells;
+            let decay = self.cfg.history_decay as f32;
             for c in 0..ncells {
-                let contested = (0..self.grid.buckets.len())
-                    .any(|b| self.usage[b * ncells + c] >= 2);
+                let contested = (0..self.grid.buckets.len()).any(|b| {
+                    self.usage[b * ncells + c] >= 2 || self.vusage[b * ncells + c] >= 2
+                });
+                // Decay first, then charge. Geometric decay bounds the field at
+                // increment / (1 - decay) -- here 0.3 / 0.15 = 2 x pitch -- so a permanently
+                // contested cell settles at about three times a free cell rather than twenty.
+                self.hist[c] *= decay;
                 if contested {
                     self.hist[c] += hist_inc;
                 }
@@ -628,6 +663,14 @@ impl<'a> Router<'a> {
             // Reroute everything while the design is still fluid: parked nets
             // holding prime corridors must be able to move aside. Once the
             // conflict set is small, focus on just those nets.
+            // Reroute everything while the design is still fluid: parked nets
+            // holding prime corridors must be able to move aside. Once the
+            // conflict set is small, focus on just those nets.
+            //
+            // Tried and reverted: rerouting ALL nets every iteration (textbook PathFinder). On the
+            // GPR main board it cost 4x the runtime and left 6 conflicts instead of 4 -- the stuck
+            // nets there are geometrically infeasible (a 600 um via cannot fan out on a 500 um
+            // pitch), so more negotiation only churns the nets that were already placed well.
             targets = if next.len() * 4 > total {
                 order.clone()
             } else {
@@ -849,6 +892,13 @@ impl<'a> Router<'a> {
             }
             (vias, len)
         };
+        // Optimisation is not negotiation. `route_net` consults the history field, which by now
+        // holds every grudge the negotiation accumulated -- so the optimiser kept re-deriving the
+        // very detour it was supposed to remove. Net-(U201-PA7) joins two pads 4 mm apart and was
+        // routed 15.8 mm, swinging 4.8 mm west and back, and survived the optimise pass untouched.
+        // Against a board that is now fixed, the only questions are "is it legal" and "is it
+        // shorter", so the history is set aside for the duration.
+        let saved_hist = std::mem::replace(&mut self.hist, vec![0.0; self.grid.ncells]);
         for pass in 0..self.cfg.optimize_passes {
             let mut improved = 0usize;
             for &n in order {
@@ -889,6 +939,7 @@ impl<'a> Router<'a> {
             }
             let _ = pass;
         }
+        self.hist = saved_hist;
     }
 
     fn finalize(&self, result: &mut RouteResult) {
@@ -1391,10 +1442,15 @@ impl<'a> Router<'a> {
                     }
                 }
                 let step = if dx != 0 && dy != 0 { diag } else { pitch };
-                // Preferred-direction penalty for this layer (diagonals pay half).
+                // Preferred-direction penalty for this layer. A diagonal advances a full cell
+                // along BOTH axes, so it owes both axes' penalties -- charging half of their sum
+                // made a diagonal the cheapest way to move against the grain: on an h-preferred
+                // layer a diagonal paid 0.175*pitch to climb a cell where a plain vertical step
+                // paid 0.35. That is backwards, and it is why the inner layers came out as a
+                // starburst of long 45 degree runs instead of an H/V grid.
                 let (hp, vp) = self.dir_pen[l];
                 let dpen = if dx != 0 && dy != 0 {
-                    (hp + vp) * 0.5
+                    hp + vp
                 } else if dx != 0 {
                     hp
                 } else {
@@ -1547,6 +1603,7 @@ impl<'a> Router<'a> {
                         &mut out.segs,
                         l,
                         width,
+                        self.cfg.neck_floor,
                         pts,
                         front_pad,
                         back_pad,
@@ -1585,6 +1642,7 @@ fn emit_necked(
     segs: &mut Vec<RouteSeg>,
     layer: usize,
     width: f64,
+    neck_floor: f64,
     pts: Vec<P>,
     front_pad: Option<usize>,
     back_pad: Option<usize>,
@@ -1592,7 +1650,10 @@ fn emit_necked(
     // Width that fits a pad: its bbox's short side (diameter for circles).
     let neck_width = |pi: usize| -> f64 {
         let (lo, hi) = board.pads[pi].shape.bbox();
-        (hi[0] - lo[0]).min(hi[1] - lo[1]).max(100.0)
+        let pad = (hi[0] - lo[0]).min(hi[1] - lo[1]).max(100.0);
+        // Never below the floor: a neck is a local accommodation for pad geometry, not a
+        // licence to halve a power rail's cross-section.
+        pad.max(neck_floor * width).min(width)
     };
     // Length of the necked section, measured along the path from the pad:
     // enough to clear the pad and its immediate neighborhood.

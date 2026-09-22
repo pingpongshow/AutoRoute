@@ -77,7 +77,38 @@ fn class_of<'a>(classes: &'a [NetClass], board: &Board, net: usize) -> &'a NetCl
 
 /// Straighten all routed polylines in place. Returns the number of vertices
 /// removed.
+/// The two octilinear corners joining `a` to `b`: one leg at 45 degrees, one
+/// orthogonal. Returns None when a->b is already axis-aligned or exactly 45,
+/// in which case the direct segment is octilinear on its own.
+fn octilinear_corners(a: P, b: P) -> Option<[P; 2]> {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let (ax, ay) = (dx.abs(), dy.abs());
+    if ax < 1.0 || ay < 1.0 || (ax - ay).abs() < 1.0 {
+        return None;
+    }
+    let m = ax.min(ay);
+    let (sx, sy) = (dx.signum(), dy.signum());
+    // Diagonal first, then straight; and straight first, then diagonal.
+    Some([
+        [a[0] + sx * m, a[1] + sy * m],
+        [b[0] - sx * m, b[1] - sy * m],
+    ])
+}
+
+/// Refinement geometry: `Any` pulls runs perfectly taut at arbitrary angles,
+/// `Octilinear` restricts every emitted segment to 0/45/90 degrees, which is
+/// what hand routing and most fab review expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefineMode {
+    Any,
+    Octilinear,
+}
+
 pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
+    refine_mode(board, result, RefineMode::Any)
+}
+
+pub fn refine_mode(board: &Board, result: &mut RouteResult, mode: RefineMode) -> usize {
     let classes = effective_classes(board);
     let mut removed = 0usize;
 
@@ -162,15 +193,39 @@ pub fn refine(board: &Board, result: &mut RouteResult) -> usize {
                     while j > i + 1 {
                         let a = pts[i];
                         let b = pts[j];
-                        if candidate_clear(
-                            a, b, layer, hw, my_ci, board, &classes, &items, &hash,
-                            &pads, &mut cand_ids, boundary_margin, &inside_boundary,
-                        ) {
+                        let mut clear = |p: P, q: P| {
+                            candidate_clear(
+                                p, q, layer, hw, my_ci, board, &classes, &items, &hash,
+                                &pads, &mut cand_ids, boundary_margin, &inside_boundary,
+                            )
+                        };
+                        // Straight shortcut: always allowed in Any mode, and in
+                        // Octilinear mode only when a->b is itself 0/45/90.
+                        let straight_ok = (mode == RefineMode::Any
+                            || octilinear_corners(a, b).is_none())
+                            && clear(a, b);
+                        if straight_ok {
                             let cut = j - i - 1;
                             pts.drain(i + 1..j);
                             pass_removed += cut;
                             done = true;
                             break;
+                        }
+                        // Octilinear shortcut: replace the run with a single
+                        // corner, one 45-degree leg plus one orthogonal leg.
+                        if mode == RefineMode::Octilinear && j > i + 2 {
+                            if let Some(corners) = octilinear_corners(a, b) {
+                                if let Some(c) = corners
+                                    .into_iter()
+                                    .find(|&c| clear(a, c) && clear(c, b))
+                                {
+                                    let cut = j - i - 2;
+                                    pts.splice(i + 1..j, [c]);
+                                    pass_removed += cut;
+                                    done = true;
+                                    break;
+                                }
+                            }
                         }
                         let span = j - i;
                         j = i + (span / 2).max(1);
@@ -248,7 +303,8 @@ fn candidate_clear(
     }
     // Pads on this layer (sampled signed distance).
     let len = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
-    let steps = ((len / 150.0).ceil() as usize).clamp(1, 256);
+    // Same under-sampling as the DRC had: 0.1 um units, so this wants a sample every 15 um.
+    let steps = ((len / 150.0).ceil() as usize).clamp(1, 4096);
     for (pad, pad_clearance) in pads.iter() {
         if !pad.layers.contains(&layer) {
             continue;

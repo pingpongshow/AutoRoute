@@ -80,9 +80,24 @@ struct Args {
     #[arg(long)]
     layer_dirs: Option<String>,
 
+    /// Never place a via inside a pad, not even one on the via's own net. Fine-pitch escapes
+    /// sometimes depend on a via in the pad, so this can leave more nets unrouted.
+    #[arg(long)]
+    no_vias_in_pads: bool,
+
+    /// Floor on pad-entry necking, as a fraction of the net class width (0..1). A track is
+    /// normally narrowed to its terminal pad's short side so it does not overhang into
+    /// neighbouring pins; 1.0 disables that and keeps every track at its class width.
+    #[arg(long, default_value_t = 0.0)]
+    neck_floor: f64,
+
     /// Skip the post-route taut-polyline refinement (any-angle straightening)
     #[arg(long)]
     no_refine: bool,
+
+    /// Restrict refined geometry to 0/45/90 degrees instead of any angle
+    #[arg(long)]
+    refine_45: bool,
 
     /// Instead of routing, render an existing SES over the DSN to SVG
     #[arg(long, value_name = "SES")]
@@ -323,6 +338,8 @@ fn main() {
         max_iterations: args.iterations,
         via_cost: args.via_cost,
         skip_classes: args.skip_classes.clone(),
+        neck_floor: args.neck_floor.clamp(0.0, 1.0),
+        no_via_in_pad: args.no_vias_in_pads,
         only_nets: args.nets.clone(),
         optimize_passes: args.optimize,
         layer_dirs: args.layer_dirs.clone(),
@@ -349,9 +366,15 @@ fn main() {
     let mut result = result;
     if !args.no_refine {
         let t1 = Instant::now();
-        let removed = autoroute_core::refine::refine(board, &mut result);
+        let mode = if args.refine_45 {
+            autoroute_core::refine::RefineMode::Octilinear
+        } else {
+            autoroute_core::refine::RefineMode::Any
+        };
+        let removed = autoroute_core::refine::refine_mode(board, &mut result, mode);
         eprintln!(
-            "refine: {} vertices straightened in {:.2}s",
+            "refine ({}): {} vertices straightened in {:.2}s",
+            if args.refine_45 { "45 deg" } else { "any angle" },
             removed,
             t1.elapsed().as_secs_f64()
         );

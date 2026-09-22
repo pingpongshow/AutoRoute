@@ -146,7 +146,10 @@ impl Grid {
     }
 
     /// Rasterize a board. `pitch` in um.
-    pub fn build(board: &Board, pitch: f64) -> (Grid, PadCells) {
+    /// `no_via_in_pad`: make every pad block via barrels for ALL nets, not just foreign ones.
+    /// By default a net may drop a via inside its own pad, which is often the only way out of a
+    /// fine-pitch package -- but it leaves a bare barrel in a solderable pad, so it is optional.
+    pub fn build(board: &Board, pitch: f64, no_via_in_pad: bool) -> (Grid, PadCells) {
         let classes = effective_classes(board);
         let (buckets, class_bucket, bucket_class) =
             make_buckets(&classes, board.pair_clearances.is_empty());
@@ -280,7 +283,8 @@ impl Grid {
                     for (b, &(margin, via_margin)) in margins.iter().enumerate() {
                         let i = grid.bi(b, c);
                         if sd <= via_margin {
-                            grid.via_block[i] = merge_owner(grid.via_block[i], owner);
+                            let vo = if no_via_in_pad { HARD } else { owner };
+                            grid.via_block[i] = merge_owner(grid.via_block[i], vo);
                         }
                         if sd > margin + quant {
                             continue;
@@ -323,12 +327,18 @@ impl Grid {
                             continue;
                         }
                         let i = grid.bi(nb_own, c);
-                        // A terminal forced out of contested/blocked space sits
-                        // inside some foreign pad's clearance margin: exits
-                        // from it must be orthogonal (diagonals dip closer).
+                        // A terminal cell that is blocked because it lies inside a FOREIGN pad's
+                        // clearance is not usable, and forcing it anyway is how this router
+                        // produced tracks 9-40 um short of their netclass clearance at every
+                        // fine-pitch escape -- a violation negotiation can never see, because it
+                        // lives in the static grid rather than in the congestion field.
+                        // Marking it `tight` only bans diagonals; it does not give back the
+                        // missing microns. So: skip it, and let the pad be reached from a cell
+                        // that is genuinely legal. If a pad has no legal cell at all, the net
+                        // fails honestly instead of shipping a short.
                         let prev = grid.block[i];
                         if prev != FREE && prev != net {
-                            grid.tight[i] = true;
+                            continue;
                         }
                         grid.block[i] = net;
                         cells.push(c);
@@ -437,7 +447,7 @@ mod tests {
     #[test]
     fn test_build_grid() {
         let board = test_board();
-        let (grid, pad_cells) = Grid::build(&board, 250.0);
+        let (grid, pad_cells) = Grid::build(&board, 250.0, false);
         assert_eq!(grid.nl, 2);
         assert_eq!(grid.buckets.len(), 1);
         assert!(!pad_cells[0].is_empty());
@@ -474,7 +484,7 @@ mod tests {
                 via_name: "v".into(),
             },
         ];
-        let (grid, _) = Grid::build(&board, 250.0);
+        let (grid, _) = Grid::build(&board, 250.0, false);
         assert_eq!(grid.buckets.len(), 2);
         // A cell near a pad passable for the thin bucket but not the fat one:
         // margin_thin = 200+125 = 325, margin_fat = max(300,200)+500 = 800.

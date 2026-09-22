@@ -234,7 +234,12 @@ pub fn check_pads(board: &Board, result: &RouteResult, tolerance: f64) -> Vec<Vi
                 }
                 for w in seg.pts.windows(2) {
                     // Sample along the segment against the pad's signed distance.
-                    let steps = ((dist(w[0], w[1]) / 100.0).ceil() as usize).clamp(1, 64);
+                    // Coordinates are 0.1 um units, so /100 asks for a sample every 10 um --
+                    // but the old clamp of 64 capped that on any segment longer than 64 um, and
+                    // the mean segment here is 4 mm. Refinement deliberately produces long
+                    // any-angle runs, which is exactly the geometry that was going unsampled:
+                    // this DRC reported 95 violations where KiCad's found several hundred.
+                    let steps = ((dist(w[0], w[1]) / 100.0).ceil() as usize).clamp(1, 8192);
                     for s in 0..=steps {
                         let t = s as f64 / steps as f64;
                         let p = [

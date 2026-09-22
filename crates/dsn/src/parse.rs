@@ -427,6 +427,22 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
         }
     }
 
+    // --- Track-only keepouts (KiCad "tracks not allowed" rule areas) export as
+    // `wire_keepout`, which this router does not model: obstacles block wires
+    // and vias alike, so honouring one would also forbid every via inside it.
+    // Warn rather than drop it silently — copper WILL be routed through.
+    for ko in structure.children("wire_keepout") {
+        let layer = ko
+            .child("polygon")
+            .and_then(|p| p.str_arg(0))
+            .unwrap_or("?")
+            .to_string();
+        warnings.push(format!(
+            "wire_keepout on {layer} ignored: tracks WILL be routed through it \
+             (track-only keepouts are not modelled)"
+        ));
+    }
+
     // --- Copper pours: each plane becomes a routable pour region for its
     // net — pads not already inside it get stitched to it with stubs and
     // vias — while never blocking other nets (the pour refills around them).
@@ -477,6 +493,47 @@ pub fn parse_dsn_opts(text: &str, keep_wiring: bool) -> Result<ParsedDsn, String
             if !seen_pour[ni] {
                 seen_pour[ni] = true;
                 poured_nets += 1;
+            }
+        }
+
+        // A pad already sitting inside its own net's pour, on a layer that pour
+        // occupies, is connected by the zone fill itself — KiCad joins it when
+        // the zone is filled. Stitching it anyway emits a redundant stub, and a
+        // stub touching a pad whose neighbour is closer than the class clearance
+        // cannot be legal at any width. Drop those pads from the routing target
+        // list; they stay in `pads` as obstacles.
+        let pour_polys: Vec<(usize, usize, PadShape)> = pads
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_pour)
+            .filter_map(|(i, p)| p.net.map(|n| (i, n, p.shape.clone())))
+            .collect();
+        if !pour_polys.is_empty() {
+            let mut covered = 0usize;
+            for (ni, net) in nets.iter_mut().enumerate() {
+                if !seen_pour[ni] {
+                    continue;
+                }
+                net.pads.retain(|&pi| {
+                    let pad = &pads[pi];
+                    if pad.is_pour {
+                        return true;
+                    }
+                    let inside = pour_polys.iter().any(|(qi, qn, shape)| {
+                        *qn == ni
+                            && pads[*qi].layers.iter().any(|l| pad.layers.contains(l))
+                            && shape.signed_dist(pad.shape.center()) < 0.0
+                    });
+                    if inside {
+                        covered += 1;
+                    }
+                    !inside
+                });
+            }
+            if covered > 0 {
+                warnings.push(format!(
+                    "{covered} pads already inside their net's pour: left to the zone fill, not stitched"
+                ));
             }
         }
     }
